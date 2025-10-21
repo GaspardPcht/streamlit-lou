@@ -5,3 +5,4 @@ plotly
 openpyxl
 reportlab
 chardet
+xlrd>=2.0.1

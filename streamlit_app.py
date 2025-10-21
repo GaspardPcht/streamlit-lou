@@ -29,7 +29,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 st.markdown('<p class="main-header">📊 Analyseur de Données Marketing</p>', unsafe_allow_html=True)
-st.write("**Importez vos fichiers CSV/XLSX — Visualisez instantanément vos données**")
+st.write("**Importez vos fichiers CSV/XLS/XLSX — Visualisez instantanément vos données**")
 
 # ========================================
 # SECTION 1 : IMPORT MULTI-FICHIERS
@@ -37,7 +37,7 @@ st.write("**Importez vos fichiers CSV/XLSX — Visualisez instantanément vos do
 
 st.sidebar.title("📁 Import de fichiers")
 uploaded_files = st.sidebar.file_uploader(
-    "Glissez vos fichiers ici (CSV ou XLSX)",
+    "Glissez vos fichiers ici (CSV, XLSX ou XLS)",
     type=["csv", "xlsx", "xls"],
     accept_multiple_files=True,
     help="Vous pouvez importer plusieurs fichiers en même temps"
@@ -50,9 +50,11 @@ def load_single_file(file_content, file_name):
     - Ignore les lignes de titre/metadata avant l’en-tête (ex: "Vues").
     - Supporte plusieurs tableaux dans un même CSV (séparés par lignes vides) et les concatène.
     - Supporte aussi plusieurs tableaux consécutifs sans ligne vide via détection d'un nouvel en-tête.
+    - Supporte les formats Excel .xls et .xlsx en essayant plusieurs engines si nécessaire.
     """
     try:
-        if file_name.lower().endswith('.csv'):
+        lower_name = file_name.lower()
+        if lower_name.endswith('.csv'):
             # Détection encodage et normalisation des fins de ligne
             result = chardet.detect(file_content)
             encoding = result.get('encoding') or 'utf-8'
@@ -178,8 +180,58 @@ def load_single_file(file_content, file_name):
             df_out.columns = [str(c).strip() for c in df_out.columns]
             return df_out
 
-        # Excel
-        return pd.read_excel(BytesIO(file_content), engine='openpyxl')
+        # Excel (.xls / .xlsx)
+        # Lire toutes les feuilles si possible puis concaténer pour robustesse
+        def _concat_sheets(x):
+            frames = []
+            if isinstance(x, dict):
+                for sheet, df_sheet in x.items():
+                    if isinstance(df_sheet, pd.DataFrame) and not df_sheet.empty:
+                        df_sheet = df_sheet.copy()
+                        df_sheet['_sheet_name'] = str(sheet)
+                        frames.append(df_sheet)
+            elif isinstance(x, pd.DataFrame):
+                return x
+            if frames:
+                return pd.concat(frames, ignore_index=True, sort=False)
+            return None
+
+        try:
+            excel_obj = pd.read_excel(BytesIO(file_content), sheet_name=None)
+            df_exc = _concat_sheets(excel_obj)
+            if df_exc is not None:
+                return df_exc
+            # fallback si concat a échoué
+            if isinstance(excel_obj, dict):
+                first = next(iter(excel_obj.values()))
+                return first
+            return excel_obj
+        except Exception:
+            # Tentatives ciblées par engine
+            if lower_name.endswith('.xls'):
+                try:
+                    excel_obj = pd.read_excel(BytesIO(file_content), engine='xlrd', sheet_name=None)
+                    df_exc = _concat_sheets(excel_obj)
+                    if df_exc is not None:
+                        return df_exc
+                    if isinstance(excel_obj, dict):
+                        return next(iter(excel_obj.values()))
+                    return excel_obj
+                except Exception as e:
+                    st.error(f"❌ Impossible de lire le fichier Excel (.xls) : {file_name}. Installez 'xlrd' (pip install xlrd). Erreur: {e}")
+                    return None
+            else:
+                try:
+                    excel_obj = pd.read_excel(BytesIO(file_content), engine='openpyxl', sheet_name=None)
+                    df_exc = _concat_sheets(excel_obj)
+                    if df_exc is not None:
+                        return df_exc
+                    if isinstance(excel_obj, dict):
+                        return next(iter(excel_obj.values()))
+                    return excel_obj
+                except Exception as e:
+                    st.error(f"❌ Impossible de lire le fichier Excel : {file_name}. Erreur: {e}")
+                    return None
 
     except Exception as e:
         st.error(f"❌ Erreur {file_name}: {str(e)}")
