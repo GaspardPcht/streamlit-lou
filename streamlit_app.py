@@ -161,20 +161,81 @@ def load_single_file(file_content, file_name):
             return {file_name: df_out}
 
         # Excel (.xls / .xlsx)
+        def _cleanup_excel_sheet(df):
+            """
+            Nettoie une feuille Excel en cherchant la vraie ligne d'en-tête.
+            On cherche la ligne avec le plus de colonnes non-vides dans les 20 premières lignes.
+            """
+            if df.empty:
+                return df
+                
+            # Scan des 20 premières lignes pour trouver le header
+            max_cols = 0
+            header_idx = 0
+            
+            # On considère aussi la première ligne (les headers actuels) comme potentielle donnée
+            # Donc on recharge ou on travaille sur le df brut
+            # Ici on travaille sur le df déjà chargé, potentiellement avec des headers faux
+            
+            # Stratégie : convertir tout en string pour compter
+            df_str = df.astype(str)
+            
+            # Vérifier la "ligne" des headers actuels
+            current_header_filled = sum(1 for c in df.columns if not str(c).startswith('Unnamed:'))
+            
+            candidates = []
+            candidates.append((0, current_header_filled)) # Index virtuel -1 ramené à 0
+            
+            # Vérifier les lignes de données
+            for i in range(min(20, len(df))):
+                row = df_str.iloc[i]
+                # Compter les valeurs non-null par rapport à "nan" ou chaîne vide
+                filled = sum(1 for x in row if x.lower() not in ['nan', 'none', '', 'nat'])
+                candidates.append((i + 1, filled)) # +1 car on est après le header
+            
+            # Trouver la meilleure ligne
+            best_row, count = max(candidates, key=lambda x: x[1])
+            
+            # Si c'était la ligne d'en-tête actuelle (0), on garde tel quel
+            # Attention: best_row est un index relatif (0 = headers actuels, 1 = 1ere ligne de data...)
+            if count <= 1: 
+                # Pas assez de colonnes pour être un tableau sérieux -> on garde
+                pass
+            elif best_row > 0:
+                # Promouvoir la ligne 'best_row - 1' (index df) en header
+                new_header = df.iloc[best_row - 1]
+                df = df.iloc[best_row:].reset_index(drop=True)
+                df.columns = new_header
+                
+            return df
+
         try:
-            # Lire toutes les feuilles et retourner le dictionnaire
-            return pd.read_excel(BytesIO(file_content), sheet_name=None)
+            # Lire sans header d'abord pour avoir la main ou lire normalement
+            # Mieux: Lire normalement et nettoyer ensuite
+            excel_dict = pd.read_excel(BytesIO(file_content), sheet_name=None)
+            cleaned_dict = {}
+            for sheet_name, sheet_df in excel_dict.items():
+                cleaned_dict[sheet_name] = _cleanup_excel_sheet(sheet_df)
+            return cleaned_dict
         except Exception:
             # Tentatives ciblées par engine
             if lower_name.endswith('.xls'):
                 try:
-                    return pd.read_excel(BytesIO(file_content), engine='xlrd', sheet_name=None)
+                    excel_dict = pd.read_excel(BytesIO(file_content), engine='xlrd', sheet_name=None)
+                    cleaned_dict = {}
+                    for sheet_name, sheet_df in excel_dict.items():
+                        cleaned_dict[sheet_name] = _cleanup_excel_sheet(sheet_df)
+                    return cleaned_dict
                 except Exception as e:
                     st.error(f"❌ Impossible de lire le fichier Excel (.xls) : {file_name}. Installez 'xlrd'. Erreur: {e}")
                     return None
             else:
                 try:
-                    return pd.read_excel(BytesIO(file_content), engine='openpyxl', sheet_name=None)
+                    excel_dict = pd.read_excel(BytesIO(file_content), engine='openpyxl', sheet_name=None)
+                    cleaned_dict = {}
+                    for sheet_name, sheet_df in excel_dict.items():
+                        cleaned_dict[sheet_name] = _cleanup_excel_sheet(sheet_df)
+                    return cleaned_dict
                 except Exception as e:
                     st.error(f"❌ Impossible de lire le fichier Excel : {file_name}. Erreur: {e}")
                     return None
