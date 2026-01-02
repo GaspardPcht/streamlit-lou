@@ -35,7 +35,7 @@ uploaded_files = st.sidebar.file_uploader(
 
 @st.cache_data
 def load_single_file(file_content, file_name):
-    """Charge un fichier CSV ou Excel."""
+    """Charge un fichier CSV ou Excel (toutes les feuilles)."""
     try:
         if file_name.lower().endswith('.csv'):
             # Détection encodage
@@ -49,30 +49,56 @@ def load_single_file(file_content, file_name):
             except:
                 delimiter = ',' if ',' in text else ';'
 
-            return pd.read_csv(StringIO(text), sep=delimiter)
+            df = pd.read_csv(StringIO(text), sep=delimiter)
+            return {file_name: df} # Uniformiser le format de retour (dict)
         else:
-            return pd.read_excel(BytesIO(file_content), engine='openpyxl')
+            # Lire toutes les feuilles
+            return pd.read_excel(BytesIO(file_content), engine='openpyxl', sheet_name=None)
     except Exception as e:
         st.error(f"❌ Erreur {file_name}: {str(e)}")
         return None
 
 # Chargement et fusion des fichiers
-df = None
+all_sheets = {} # Dictionnaire pour stocker toutes les feuilles de tous les fichiers
 if uploaded_files:
     with st.spinner('⏳ Chargement des fichiers...'):
-        dfs = []
         for uploaded_file in uploaded_files:
             file_content = uploaded_file.read()
-            loaded_df = load_single_file(file_content, uploaded_file.name)
-            if loaded_df is not None:
-                loaded_df['_fichier_source'] = uploaded_file.name
-                dfs.append(loaded_df)
+            loaded_data = load_single_file(file_content, uploaded_file.name)
+            
+            if loaded_data:
+                for sheet_name, df_sheet in loaded_data.items():
+                    # Créer un nom unique pour chaque feuille : "NomFichier - NomFeuille"
+                    unique_name = f"{uploaded_file.name} - {sheet_name}" if len(loaded_data) > 1 else uploaded_file.name
+                    df_sheet['_fichier_source'] = uploaded_file.name
+                    df_sheet['_feuille_source'] = sheet_name
+                    all_sheets[unique_name] = df_sheet
 
-        if dfs:
+    if all_sheets:
+        st.sidebar.success(f"✅ {len(all_sheets)} feuille(s) chargée(s)")
+        
+        # Affichage des schémas individuels
+        st.subheader("📋 Aperçu des feuilles individuelles")
+        for name, sheet_df in all_sheets.items():
+            with st.expander(f"Feuille : {name}", expanded=False):
+                st.write(f"**Dimensions :** {sheet_df.shape[0]} lignes, {sheet_df.shape[1]} colonnes")
+                st.dataframe(sheet_df.head(50), use_container_width=True)
+                
+        # Option de fusion
+        st.markdown("---")
+        if st.button("🔄 Fusionner toutes les feuilles pour l'analyse globale", type="primary"):
+            dfs = list(all_sheets.values())
             df = pd.concat(dfs, ignore_index=True, sort=False)
-            st.sidebar.success(f"✅ {len(dfs)} fichier(s) chargé(s) — {len(df):,} lignes au total")
+            st.success(f"✅ Fusion réussie : {len(df):,} lignes au total")
         else:
-            st.sidebar.error("❌ Aucun fichier valide")
+            df = None # On ne fait pas l'analyse globale tant que pas cliqué
+            st.info("👆 Cliquez sur le bouton ci-dessus pour lancer l'analyse complète (fusion des données).")
+
+    else:
+        st.sidebar.error("❌ Aucun fichier valide")
+        df = None
+else:
+    df = None
 
 # ========================================
 # SECTION 2 : TRAITEMENT DES DONNÉES
