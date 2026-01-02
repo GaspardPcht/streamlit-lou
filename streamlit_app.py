@@ -1,12 +1,22 @@
 import streamlit as st
 import pandas as pd
-import numpy as np
 import csv
 import chardet
 from io import StringIO, BytesIO
 import plotly.express as px
 import plotly.graph_objects as go
 from datetime import datetime
+
+# Import optionnel de reportlab (PDF)
+try:
+    from reportlab.lib.pagesizes import A4
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.units import inch
+    from reportlab.lib import colors
+    HAS_REPORTLAB = True
+except Exception:
+    HAS_REPORTLAB = False
 
 st.set_page_config(page_title="📊 Analyseur Marketing", layout="wide")
 
@@ -19,7 +29,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 st.markdown('<p class="main-header">📊 Analyseur de Données Marketing</p>', unsafe_allow_html=True)
-st.write("**Importez vos fichiers CSV/XLSX — Visualisez instantanément vos données**")
+st.write("**Importez vos fichiers CSV/XLS/XLSX — Visualisez instantanément vos données**")
 
 # ========================================
 # SECTION 1 : IMPORT MULTI-FICHIERS
@@ -27,7 +37,7 @@ st.write("**Importez vos fichiers CSV/XLSX — Visualisez instantanément vos do
 
 st.sidebar.title("📁 Import de fichiers")
 uploaded_files = st.sidebar.file_uploader(
-    "Glissez vos fichiers ici (CSV ou XLSX)",
+    "Glissez vos fichiers ici (CSV, XLSX ou XLS)",
     type=["csv", "xlsx", "xls"],
     accept_multiple_files=True,
     help="Vous pouvez importer plusieurs fichiers en même temps"
@@ -35,25 +45,140 @@ uploaded_files = st.sidebar.file_uploader(
 
 @st.cache_data
 def load_single_file(file_content, file_name):
-    """Charge un fichier CSV ou Excel (toutes les feuilles)."""
+    """Charge un fichier CSV/Excel de manière robuste.
+    - Gère 'sep=,' en première ligne.
+    - Ignore les lignes de titre/metadata avant l’en-tête.
+    - Supporte plusieurs tableaux dans un même CSV.
+    - Supporte les formats Excel .xls et .xlsx.
+    Retourne un dictionnaire {nom_feuille: dataframe} ou {nom_fichier: dataframe}.
+    """
     try:
-        if file_name.lower().endswith('.csv'):
-            # Détection encodage
+        lower_name = file_name.lower()
+        if lower_name.endswith('.csv'):
+            # Détection encodage et normalisation des fins de ligne
             result = chardet.detect(file_content)
-            encoding = result.get('encoding', 'utf-8')
-            text = file_content.decode(encoding, errors='ignore')
+            encoding = result.get('encoding') or 'utf-8'
+            text = file_content.decode(encoding, errors='ignore').replace('\r\n', '\n').replace('\r', '\n')
+            lines = text.split('\n')
 
-            # Détection séparateur
-            try:
-                delimiter = csv.Sniffer().sniff(text[:5000]).delimiter
-            except:
-                delimiter = ',' if ',' in text else ';'
+            # 1) Détecter 'sep=' et le sauter
+            sep = None
+            start_idx = 0
+            if lines and lines[0].strip().lower().startswith('sep='):
+                cand = lines[0].split('=', 1)[1].strip()
+                sep = cand[0] if cand else ','
+                start_idx = 1
 
-            df = pd.read_csv(StringIO(text), sep=delimiter)
-            return {file_name: df} # Uniformiser le format de retour (dict)
-        else:
-            # Lire toutes les feuilles
-            return pd.read_excel(BytesIO(file_content), engine='openpyxl', sheet_name=None)
+            # 2) Détecter le séparateur si non fixé
+            if sep is None:
+                sample = '\n'.join(lines[:50])
+                try:
+                    sep = csv.Sniffer().sniff(sample).delimiter
+                except Exception:
+                    sep = ',' if sample.count(',') >= sample.count(';') else ';'
+
+            # 3) Trouver la vraie ligne d'en-tête (ignore titres/metadata comme "Vues")
+            header_idx = start_idx
+            for i in range(start_idx, min(len(lines), 200)):
+                raw = lines[i].lstrip('\ufeff').strip()
+                if not raw or raw.lower().startswith('sep='):
+                    continue
+                # en-tête plausible si contient au moins un séparateur
+                if sep in raw and raw.count(sep) >= 1:
+                    header_idx = i
+                    break
+
+            # 4) Contenu utile
+            clean_text = '\n'.join(lines[header_idx:]).lstrip('\ufeff').strip()
+
+            # 5) Essayer de lire plusieurs blocs (plusieurs tableaux séparés par lignes vides)
+            blocks = [b.strip() for b in clean_text.split('\n\n') if b.strip()]
+            frames = []
+            table_counter = 0
+            for b in blocks:
+                # Détection d'en-têtes internes
+                sub_lines_all = [ln for ln in b.split('\n') if ln is not None]
+                sub_lines = [ln for ln in sub_lines_all if ln.strip() != '']
+                if not sub_lines:
+                    continue
+                base_header = sub_lines[0].strip()
+
+                # Trouver positions d'en-tête candidates
+                header_positions = []
+                for j, ln in enumerate(sub_lines):
+                    s = ln.strip()
+                    if not s:
+                        continue
+                    if s == base_header:
+                        header_positions.append(j)
+                        continue
+                    if sep in s:
+                        fields = [x.strip().strip('"') for x in s.split(sep)]
+                        if len(fields) >= 1:
+                            non_digit_text = 0
+                            for f in fields:
+                                f2 = f.replace('\xa0', '').strip()
+                                has_alpha = any(ch.isalpha() for ch in f2)
+                                has_digit = any(ch.isdigit() for ch in f2)
+                                if has_alpha and not has_digit:
+                                    non_digit_text += 1
+                            if non_digit_text >= max(1, len(fields)//2):
+                                header_positions.append(j)
+
+                header_positions = sorted(set(header_positions))
+
+                if len(header_positions) > 1:
+                    for s_idx, start in enumerate(header_positions):
+                        end = header_positions[s_idx + 1] if s_idx + 1 < len(header_positions) else len(sub_lines)
+                        seg = '\n'.join(sub_lines[start:end]).strip()
+                        if not seg:
+                            continue
+                        try:
+                            df_block = pd.read_csv(StringIO(seg), sep=sep, engine='python', on_bad_lines='skip')
+                            if df_block.shape[0] > 0 and df_block.shape[1] >= 1:
+                                table_counter += 1
+                                df_block['_table_id'] = table_counter
+                                frames.append(df_block)
+                        except Exception:
+                            continue
+                else:
+                    try:
+                        df_block = pd.read_csv(StringIO(b), sep=sep, engine='python', on_bad_lines='skip')
+                        if df_block.shape[0] > 0 and df_block.shape[1] >= 1:
+                            table_counter += 1
+                            df_block['_table_id'] = table_counter
+                            frames.append(df_block)
+                    except Exception:
+                        continue
+
+            if frames:
+                df_out = pd.concat(frames, ignore_index=True, sort=False)
+            else:
+                df_out = pd.read_csv(StringIO(clean_text), sep=sep, engine='python', on_bad_lines='skip')
+
+            # Nettoyage léger des noms de colonnes
+            df_out.columns = [str(c).strip() for c in df_out.columns]
+            return {file_name: df_out}
+
+        # Excel (.xls / .xlsx)
+        try:
+            # Lire toutes les feuilles et retourner le dictionnaire
+            return pd.read_excel(BytesIO(file_content), sheet_name=None)
+        except Exception:
+            # Tentatives ciblées par engine
+            if lower_name.endswith('.xls'):
+                try:
+                    return pd.read_excel(BytesIO(file_content), engine='xlrd', sheet_name=None)
+                except Exception as e:
+                    st.error(f"❌ Impossible de lire le fichier Excel (.xls) : {file_name}. Installez 'xlrd'. Erreur: {e}")
+                    return None
+            else:
+                try:
+                    return pd.read_excel(BytesIO(file_content), engine='openpyxl', sheet_name=None)
+                except Exception as e:
+                    st.error(f"❌ Impossible de lire le fichier Excel : {file_name}. Erreur: {e}")
+                    return None
+
     except Exception as e:
         st.error(f"❌ Erreur {file_name}: {str(e)}")
         return None
@@ -120,37 +245,32 @@ def detect_column_types(df):
             except:
                 pass
 
-    # Conversion automatique des nombres (même s'ils sont stockés comme texte)
+    # Conversion automatique des nombres
     for col in df.columns:
         if col == '_fichier_source':
             continue
-        # Si la colonne est déjà numérique, on passe
         if pd.api.types.is_numeric_dtype(df[col]):
             continue
-        # Si c'est une date, on passe aussi
         if pd.api.types.is_datetime64_any_dtype(df[col]):
             continue
-        # Essayer de convertir en numérique
         if df[col].dtype == 'object':
             try:
-                # Nettoyer TOUS les caractères non numériques courants
                 test_series = df[col].dropna().astype(str).head(100)
                 cleaned = (
                     df[col]
                     .astype(str)
                     .str.strip()
-                    .str.replace('\xa0', '', regex=False)  # Espace insécable
+                    .str.replace('\xa0', '', regex=False)
                     .str.replace(' ', '', regex=False)
-                    .str.replace(',', '.', regex=False)   # Virgule décimale
+                    .str.replace(',', '.', regex=False)
                     .str.replace('€', '', regex=False)
                     .str.replace('$', '', regex=False)
                     .str.replace('£', '', regex=False)
                     .str.replace('%', '', regex=False)
-                    .str.replace('−', '-', regex=False)   # Signe moins spécial
+                    .str.replace('−', '-', regex=False)
                     .str.replace('+', '', regex=False)
                 )
                 converted = pd.to_numeric(cleaned, errors='coerce')
-                # Si au moins 50% des valeurs sont des nombres, on convertit
                 valid_ratio = converted.notna().sum() / len(df)
                 if valid_ratio >= 0.5:
                     df[col] = converted
@@ -161,6 +281,69 @@ def detect_column_types(df):
     numeric_cols = [c for c in df.columns if c != '_fichier_source' and pd.api.types.is_numeric_dtype(df[c])]
     date_cols = [c for c in df.columns if c != '_fichier_source' and pd.api.types.is_datetime64_any_dtype(df[c])]
     text_cols = [c for c in df.columns if c != '_fichier_source' and c not in numeric_cols and c not in date_cols]
+
+    return df, numeric_cols, date_cols, text_cols
+
+
+def add_derived_features(df, numeric_cols, date_cols, text_cols):
+    """
+    Ajoute des colonnes dérivées pour que toutes les visualisations puissent fonctionner.
+    """
+    df = df.copy()
+    new_text = []
+    new_num = []
+
+    if date_cols:
+        d = date_cols[0]
+        try:
+            df[d] = pd.to_datetime(df[d], errors='coerce')
+        except Exception:
+            pass
+
+        # Dérivées catégorielles
+        if 'Mois' not in df.columns:
+            df['Mois'] = df[d].dt.to_period('M').astype(str)
+            new_text.append('Mois')
+        if 'Année' not in df.columns:
+            df['Année'] = df[d].dt.year.astype('Int64')
+            df['Année'] = df['Année'].astype('string')
+            new_text.append('Année')
+        if 'JourSemaine' not in df.columns:
+            jours_fr = ['Lundi', 'Mardi', 'Mercredi', 'Jeudi', 'Vendredi', 'Samedi', 'Dimanche']
+            df['JourSemaine'] = df[d].dt.weekday.map(lambda i: jours_fr[int(i)] if pd.notna(i) else None)
+            new_text.append('JourSemaine')
+        if 'SemaineISO' not in df.columns:
+            try:
+                iso = df[d].dt.isocalendar()
+                df['SemaineISO'] = (df[d].dt.year.astype('Int64').astype('string')
+                                    + '-W' + iso.week.astype('Int64').astype('string'))
+                new_text.append('SemaineISO')
+            except Exception:
+                pass
+
+    # Numériques dérivées
+    if len(numeric_cols) == 1:
+        n = numeric_cols[0]
+        if date_cols:
+            df = df.sort_values(by=date_cols[0], kind='stable')
+        cum_name = f'{n}_cumule'
+        roll_name = f'{n}_rolling7'
+        if cum_name not in df.columns:
+            try:
+                df[cum_name] = df[n].cumsum()
+                new_num.append(cum_name)
+            except Exception:
+                pass
+        if roll_name not in df.columns:
+            try:
+                df[roll_name] = df[n].rolling(window=7, min_periods=1).mean()
+                new_num.append(roll_name)
+            except Exception:
+                pass
+
+    # Mettre à jour les listes de colonnes
+    text_cols = text_cols + [c for c in new_text if c not in text_cols]
+    numeric_cols = numeric_cols + [c for c in new_num if c not in numeric_cols]
 
     return df, numeric_cols, date_cols, text_cols
 
@@ -241,6 +424,8 @@ if df is None:
 else:
     # Traitement des données
     df, numeric_cols, date_cols, text_cols = detect_column_types(df)
+    # Ajout des colonnes dérivées pour assurer le fonctionnement des graphes
+    df, numeric_cols, date_cols, text_cols = add_derived_features(df, numeric_cols, date_cols, text_cols)
 
     # KPIs en haut
     col1, col2, col3, col4 = st.columns(4)
@@ -321,7 +506,7 @@ else:
                     names='Catégorie',
                     values='Valeur',
                     title=f"Top {top_n} - {pie_col}",
-                    hole=0.3,  # Donut
+                    hole=0.3,
                     color_discrete_sequence=px.colors.qualitative.Set3
                 )
                 fig.update_traces(
@@ -385,26 +570,36 @@ else:
     with viz_tabs[2]:
         st.markdown("### 📈 Évolution temporelle")
         if date_cols and numeric_cols:
-            col_line1, col_line2 = st.columns(2)
+            col_line1, col_line2, col_line3 = st.columns(3)
             with col_line1:
                 line_date = st.selectbox("Date", date_cols, key="line_date")
             with col_line2:
                 line_val = st.selectbox("Valeur", numeric_cols, key="line_val")
+            with col_line3:
+                line_gran = st.selectbox("Granularité", ["Jour", "Semaine", "Mois"], index=0, key="line_gran")
 
-            # Agrégation par jour
+            # Agrégation selon la granularité
             df_line = df_filtered.dropna(subset=[line_date]).copy()
-            df_line['_date'] = pd.to_datetime(df_line[line_date]).dt.date
-            line_data = df_line.groupby('_date')[line_val].sum().reset_index()
+            dts = pd.to_datetime(df_line[line_date])
+            if line_gran == "Jour":
+                df_line['_bucket'] = dts.dt.date
+            elif line_gran == "Semaine":
+                # Lundi comme début de semaine
+                df_line['_bucket'] = (dts - pd.to_timedelta(dts.dt.weekday, unit='D')).dt.date
+            else:  # Mois
+                df_line['_bucket'] = dts.dt.to_period('M').dt.to_timestamp().dt.date
+
+            line_data = df_line.groupby('_bucket')[line_val].sum().reset_index().sort_values('_bucket')
 
             if len(line_data) > 0:
                 fig = px.line(
                     line_data,
-                    x='_date',
+                    x='_bucket',
                     y=line_val,
-                    title=f"Évolution de {line_val}",
+                    title=f"Évolution de {line_val} par {line_gran}",
                     markers=True
                 )
-                fig.update_layout(hovermode='x unified', height=500)
+                fig.update_layout(hovermode='x unified', height=500, xaxis_title=line_gran)
                 st.plotly_chart(fig, use_container_width=True)
             else:
                 st.warning("Aucune donnée à afficher")
@@ -473,7 +668,7 @@ else:
             else:
                 st.warning("Aucune donnée à afficher")
         else:
-            st.info("Il faut au moins 2 colonnes catégorielles et 1 colonne numérique")
+            st.info("Il faut au moins 2 colonnes catégorielle et 1 colonne numérique")
 
     # TAB 6: HEATMAP
     with viz_tabs[5]:
@@ -516,7 +711,7 @@ else:
             else:
                 st.warning("Aucune donnée à afficher")
         else:
-            st.info("Il faut au moins 2 colonnes catégorielles et 1 colonne numérique")
+            st.info("Il faut au moins 2 colonnes catégorielle et 1 colonne numérique")
 
     # TAB 7: SCATTER
     with viz_tabs[6]:
@@ -555,123 +750,126 @@ else:
     st.subheader("📄 Export du rapport")
 
     if st.button("🎯 Générer le rapport PDF", type="primary"):
-        try:
-            from reportlab.lib.pagesizes import A4
-            from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak
-            from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-            from reportlab.lib.units import inch
-            from reportlab.lib import colors
+        if not HAS_REPORTLAB:
+            st.error("❌ La bibliothèque reportlab n'est pas installée. Exécutez : pip install reportlab")
+        else:
+            try:
+                pdf_buffer = BytesIO()
+                doc = SimpleDocTemplate(pdf_buffer, pagesize=A4)
+                story = []
+                styles = getSampleStyleSheet()
 
-            pdf_buffer = BytesIO()
-            doc = SimpleDocTemplate(pdf_buffer, pagesize=A4)
-            story = []
-            styles = getSampleStyleSheet()
+                # Titre
+                title_style = ParagraphStyle(
+                    'CustomTitle',
+                    parent=styles['Heading1'],
+                    fontSize=24,
+                    textColor=colors.HexColor('#1f77b4'),
+                    spaceAfter=30
+                )
+                story.append(Paragraph("📊 Rapport d'Analyse Marketing", title_style))
+                story.append(Paragraph(f"Généré le {datetime.now().strftime('%d/%m/%Y à %H:%M')}", styles['Normal']))
+                story.append(Spacer(1, 0.3*inch))
 
-            # Titre
-            title_style = ParagraphStyle(
-                'CustomTitle',
-                parent=styles['Heading1'],
-                fontSize=24,
-                textColor=colors.HexColor('#1f77b4'),
-                spaceAfter=30
-            )
-            story.append(Paragraph("📊 Rapport d'Analyse Marketing", title_style))
-            story.append(Paragraph(f"Généré le {datetime.now().strftime('%d/%m/%Y à %H:%M')}", styles['Normal']))
-            story.append(Spacer(1, 0.3*inch))
+                # Résumé des données
+                story.append(Paragraph("📋 Résumé des données", styles['Heading2']))
+                # Pré-calcul des valeurs pour éviter des f-strings imbriquées
+                nb_lignes = f"{len(df_filtered):,}"
+                nb_colonnes = f"{len(df_filtered.columns)}"
+                fichiers_sources = (
+                    df_filtered['_fichier_source'].nunique() if '_fichier_source' in df_filtered.columns else 'N/A'
+                )
+                periode_analyse = datetime.now().strftime('%B %Y')
 
-            # Résumé des données
-            story.append(Paragraph("📋 Résumé des données", styles['Heading2']))
-            summary_data = [
-                ['Métrique', 'Valeur'],
-                ['Nombre de lignes', f"{len(df_filtered):,}"],
-                ['Nombre de colonnes', f"{len(df_filtered.columns)}"],
-                ['Fichiers sources', f"{df_filtered['_fichier_source'].nunique() if '_fichier_source' in df_filtered.columns else 'N/A'}"],
-                ['Période d\'analyse', f"{datetime.now().strftime('%B %Y')}"]
-            ]
+                summary_data = [
+                    ['Métrique', 'Valeur'],
+                    ['Nombre de lignes', nb_lignes],
+                    ['Nombre de colonnes', nb_colonnes],
+                    ['Fichiers sources', str(fichiers_sources)],
+                    ['Période d\'analyse', periode_analyse]
+                ]
 
-            summary_table = Table(summary_data, colWidths=[3*inch, 3*inch])
-            summary_table.setStyle(TableStyle([
-                ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
-                ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
-                ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
-                ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-                ('FONTSIZE', (0, 0), (-1, 0), 12),
-                ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
-                ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
-                ('GRID', (0, 0), (-1, -1), 1, colors.black)
-            ]))
-            story.append(summary_table)
-            story.append(Spacer(1, 0.3*inch))
-
-            # Top catégories
-            if text_cols:
-                story.append(PageBreak())
-                story.append(Paragraph(f"🏆 Top catégories - {text_cols[0]}", styles['Heading2']))
-                top_cats = df_filtered[text_cols[0]].value_counts().head(10).reset_index()
-                top_cats.columns = ['Catégorie', 'Nombre']
-
-                cat_data = [['Catégorie', 'Nombre']]
-                for _, row in top_cats.iterrows():
-                    cat_data.append([str(row['Catégorie'])[:50], f"{row['Nombre']:,}"])
-
-                cat_table = Table(cat_data, colWidths=[4*inch, 2*inch])
-                cat_table.setStyle(TableStyle([
-                    ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#1f77b4')),
+                summary_table = Table(summary_data, colWidths=[3*inch, 3*inch])
+                summary_table.setStyle(TableStyle([
+                    ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
                     ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
                     ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
                     ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-                    ('FONTSIZE', (0, 0), (-1, 0), 11),
+                    ('FONTSIZE', (0, 0), (-1, 0), 12),
                     ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
-                    ('BACKGROUND', (0, 1), (-1, -1), colors.lightblue),
-                    ('GRID', (0, 0), (-1, -1), 1, colors.black),
-                    ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.lightgrey])
-                ]))
-                story.append(cat_table)
-
-            # Statistiques numériques
-            if numeric_cols:
-                story.append(PageBreak())
-                story.append(Paragraph("📊 Statistiques des valeurs numériques", styles['Heading2']))
-
-                stats_data = [['Colonne', 'Minimum', 'Maximum', 'Moyenne', 'Total']]
-                for col in numeric_cols[:5]:  # Limiter à 5 colonnes
-                    stats_data.append([
-                        col[:30],
-                        f"{df_filtered[col].min():.2f}",
-                        f"{df_filtered[col].max():.2f}",
-                        f"{df_filtered[col].mean():.2f}",
-                        f"{df_filtered[col].sum():.2f}"
-                    ])
-
-                stats_table = Table(stats_data, colWidths=[2*inch, 1*inch, 1*inch, 1*inch, 1.5*inch])
-                stats_table.setStyle(TableStyle([
-                    ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#2ca02c')),
-                    ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
-                    ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-                    ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-                    ('FONTSIZE', (0, 0), (-1, -1), 9),
-                    ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
-                    ('BACKGROUND', (0, 1), (-1, -1), colors.lightgreen),
+                    ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
                     ('GRID', (0, 0), (-1, -1), 1, colors.black)
                 ]))
-                story.append(stats_table)
+                story.append(summary_table)
+                story.append(Spacer(1, 0.3*inch))
 
-            # Générer le PDF
-            doc.build(story)
-            pdf_buffer.seek(0)
+                # Top catégories
+                if text_cols:
+                    story.append(PageBreak())
+                    story.append(Paragraph(f"🏆 Top catégories - {text_cols[0]}", styles['Heading2']))
+                    top_cats = df_filtered[text_cols[0]].value_counts().head(10).reset_index()
+                    top_cats.columns = ['Catégorie', 'Nombre']
 
-            st.success("✅ Rapport généré avec succès !")
-            st.download_button(
-                "📥 Télécharger le rapport PDF",
-                pdf_buffer,
-                f"rapport_marketing_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf",
-                "application/pdf"
-            )
+                    cat_data = [['Catégorie', 'Nombre']]
+                    for _, row in top_cats.iterrows():
+                        cat_data.append([str(row['Catégorie'])[:50], f"{row['Nombre']:,}"])
 
-        except ImportError:
-            st.error("❌ La bibliothèque reportlab n'est pas installée. Exécutez : pip install reportlab")
-        except Exception as e:
-            st.error(f"❌ Erreur lors de la génération du PDF : {str(e)}")
+                    cat_table = Table(cat_data, colWidths=[4*inch, 2*inch])
+                    cat_table.setStyle(TableStyle([
+                        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#1f77b4')),
+                        ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+                        ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+                        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                        ('FONTSIZE', (0, 0), (-1, 0), 11),
+                        ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+                        ('BACKGROUND', (0, 1), (-1, -1), colors.lightblue),
+                        ('GRID', (0, 0), (-1, -1), 1, colors.black),
+                        ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.lightgrey])
+                    ]))
+                    story.append(cat_table)
+
+                # Statistiques numériques
+                if numeric_cols:
+                    story.append(PageBreak())
+                    story.append(Paragraph("📊 Statistiques des valeurs numériques", styles['Heading2']))
+
+                    stats_data = [['Colonne', 'Minimum', 'Maximum', 'Moyenne', 'Total']]
+                    for col in numeric_cols[:5]:  # Limiter à 5 colonnes
+                        stats_data.append([
+                            col[:30],
+                            f"{df_filtered[col].min():.2f}",
+                            f"{df_filtered[col].max():.2f}",
+                            f"{df_filtered[col].mean():.2f}",
+                            f"{df_filtered[col].sum():.2f}"
+                        ])
+
+                    stats_table = Table(stats_data, colWidths=[2*inch, 1*inch, 1*inch, 1*inch, 1.5*inch])
+                    stats_table.setStyle(TableStyle([
+                        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#2ca02c')),
+                        ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+                        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+                        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                        ('FONTSIZE', (0, 0), (-1, -1), 9),
+                        ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+                        ('BACKGROUND', (0, 1), (-1, -1), colors.lightgreen),
+                        ('GRID', (0, 0), (-1, -1), 1, colors.black)
+                    ]))
+                    stats_table.append(stats_table)
+
+                # Générer le PDF
+                doc.build(story)
+                pdf_buffer.seek(0)
+
+                st.success("✅ Rapport généré avec succès !")
+                st.download_button(
+                    "📥 Télécharger le rapport PDF",
+                    pdf_buffer,
+                    f"rapport_marketing_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf",
+                    "application/pdf"
+                )
+
+            except Exception as e:
+                st.error(f"❌ Erreur lors de la génération du PDF : {str(e)}")
 
 st.markdown("---")
 st.caption("💡 Astuce : Les filtres sont dans la barre latérale. Les graphiques s'adaptent automatiquement à vos données !")
